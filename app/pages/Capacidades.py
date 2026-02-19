@@ -10,6 +10,7 @@ INPUTS = BASE_PATH / "inputs"
 PROCESSED = BASE_PATH / "processed"
 PROCESSED.mkdir(parents=True, exist_ok=True)
 
+# --- Selección de archivo (caso) ---
 archivo = st.selectbox(
     "Caso de capacidades",
     [
@@ -27,17 +28,18 @@ if not csv_path.exists():
 
 df = pd.read_csv(csv_path)
 
-# Validación mínima de columnas esperadas
+# --- Validación mínima de columnas ---
 cols = {"system", "technology", "capacity_mw"}
 if not cols.issubset(df.columns):
     st.error(f"El CSV debe tener columnas {sorted(list(cols))}. Encontré: {list(df.columns)}")
     st.stop()
 
+# --- Selección de sistema ---
 sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"])
 
 df_sys = df[df["system"] == sistema].copy()
 
-# ✅ Mostrar tabla SIN la columna system
+# Mostramos tabla SIN la columna system
 df_display = df_sys[["technology", "capacity_mw"]].copy()
 
 st.subheader("Tabla (editable)")
@@ -51,16 +53,17 @@ edited_display = st.data_editor(
     },
 )
 
-# ✅ Re-agregar system para guardar/descargar
+# Re-agregamos system para guardar/descargar
 edited_full = edited_display.copy()
-edited_full["system"] = sistema
+edited_full.insert(0, "system", sistema)  # pone system como primera columna
 edited_full = edited_full[["system", "technology", "capacity_mw"]]
 
-col1, col2 = st.columns(2)
-
-# Preparamos df_out SIEMPRE para poder descargarlo
+# Reintegramos cambios al dataset completo (todos los sistemas)
 df_other = df[df["system"] != sistema].copy()
-df_out = pd.concat([df_other, edited], ignore_index=True)
+df_out = pd.concat([df_other, edited_full], ignore_index=True)
+df_out = df_out[["system", "technology", "capacity_mw"]].sort_values(["system", "technology"])
+
+col1, col2 = st.columns(2)
 
 with col1:
     st.download_button(
@@ -73,11 +76,9 @@ with col1:
 with col2:
     st.download_button(
         "Descargar CSV editado (solo este sistema)",
-        data=edited.to_csv(index=False).encode("utf-8"),
+        data=edited_full.to_csv(index=False).encode("utf-8"),
         file_name=f"{sistema}_{Path(archivo).stem}.csv",
         mime="text/csv",
     )
 
-
 st.info("Tip: Semana 3 pide que estas capacidades sean trazables (fuente oficial + supuestos 2026 documentados).")
-
