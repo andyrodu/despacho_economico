@@ -58,23 +58,26 @@ edited_full = edited_full[["system", "technology", "capacity_mw"]]
 
 col1, col2 = st.columns(2)
 
+# Preparamos df_out SIEMPRE para poder descargarlo
+df_other = df[df["system"] != sistema].copy()
+df_out = pd.concat([df_other, edited], ignore_index=True)
+
 with col1:
-    if st.button("Guardar cambios (processed)"):
-        # Reintegrar cambios al df completo
-        df_other = df[df["system"] != sistema].copy()
-        df_out = pd.concat([df_other, edited_full], ignore_index=True)
-
-        out_path = PROCESSED / f"{Path(archivo).stem}_edited.csv"
-        df_out.to_csv(out_path, index=False)
-
-        st.success(f"Guardado: {out_path}")
+    st.download_button(
+        "Guardar cambios (descargar CSV completo)",
+        data=df_out.to_csv(index=False).encode("utf-8"),
+        file_name=f"{Path(archivo).stem}_edited.csv",
+        mime="text/csv",
+    )
 
 with col2:
     st.download_button(
         "Descargar CSV editado (solo este sistema)",
-        data=edited_full.to_csv(index=False).encode("utf-8"),
+        data=edited.to_csv(index=False).encode("utf-8"),
         file_name=f"{sistema}_{Path(archivo).stem}.csv",
         mime="text/csv",
     )
 
+
 st.info("Tip: Semana 3 pide que estas capacidades sean trazables (fuente oficial + supuestos 2026 documentados).")
+
