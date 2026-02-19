@@ -1,17 +1,9 @@
-import base64
-import json
+import streamlit as st
+import pandas as pd
 from pathlib import Path
 
-import pandas as pd
-import requests
-import streamlit as st
-
-
-# ----------------------------
-# CONFIG / PATHS
-# ----------------------------
 st.title("Capacidades")
-st.caption("Semana 1: estructura. Semana 3: conectar CSVs (capacidad por sistema y caso 2026).")
+st.caption("Semana 2: cargar/editar capacidades por sistema (SIN/BCA/BCS) con CSVs. Luego se reemplazan por datos reales.")
 
 BASE_PATH = Path("data")
 INPUTS = BASE_PATH / "inputs"
@@ -19,7 +11,7 @@ PROCESSED = BASE_PATH / "processed"
 INPUTS.mkdir(parents=True, exist_ok=True)
 PROCESSED.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_TECHS = [
+TECNOLOGIAS_BASE = [
     "Ciclo combinado",
     "Térmica convencional",
     "Hidro",
@@ -28,114 +20,51 @@ DEFAULT_TECHS = [
     "Nuclear",
 ]
 
-# ----------------------------
-# GITHUB COMMIT HELPERS
-# ----------------------------
-def _get_secret(name: str, default=None):
-    # Permite correr local sin secrets (no truena)
-    return st.secrets.get(name, default) if hasattr(st, "secrets") else default
-
-
-GITHUB_TOKEN = _get_secret("GITHUB_TOKEN", None)
-GITHUB_OWNER = _get_secret("GITHUB_OWNER", None)
-GITHUB_REPO = _get_secret("GITHUB_REPO", None)
-GITHUB_BRANCH = _get_secret("GITHUB_BRANCH", "main")
-
-
-def github_put_file(
-    *,
-    owner: str,
-    repo: str,
-    branch: str,
-    token: str,
-    path_in_repo: str,
-    content_bytes: bytes,
-    commit_message: str,
-):
-    """
-    Crea/actualiza un archivo en GitHub usando Contents API.
-    """
-    if not all([owner, repo, branch, token]):
-        raise ValueError("Faltan secrets de GitHub (OWNER/REPO/BRANCH/TOKEN).")
-
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path_in_repo}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    # 1) Revisar si existe para obtener SHA
-    sha = None
-    r_get = requests.get(api_url, headers=headers, params={"ref": branch}, timeout=30)
-    if r_get.status_code == 200:
-        sha = r_get.json().get("sha")
-    elif r_get.status_code in (404,):
-        sha = None
-    else:
-        raise RuntimeError(f"GitHub GET error {r_get.status_code}: {r_get.text}")
-
-    # 2) Hacer PUT con base64 content
-    b64 = base64.b64encode(content_bytes).decode("utf-8")
-    payload = {
-        "message": commit_message,
-        "content": b64,
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    r_put = requests.put(api_url, headers=headers, data=json.dumps(payload), timeout=30)
-    if r_put.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub PUT error {r_put.status_code}: {r_put.text}")
-
-    return r_put.json()
-
-
-# ----------------------------
-# UI: SELECT CASE / LOAD DATA
-# ----------------------------
-case_label, archivo = st.selectbox(
+archivo = st.selectbox(
     "Caso de capacidades",
     [
         ("Base (2024)", "capacity_2024_by_system.csv"),
         ("Caso 2026", "capacity_2026_case.csv"),
     ],
     format_func=lambda x: x[0],
-)
+)[1]
 
 csv_path = INPUTS / archivo
 
-if csv_path.exists():
-    df = pd.read_csv(csv_path)
-else:
-    st.warning(f"No encontré {csv_path}. Te muestro una plantilla para que puedas llenar y guardar/commitear.")
-    df = pd.DataFrame(
-        {
-            "system": ["SIN"] * len(DEFAULT_TECHS),
-            "technology": DEFAULT_TECHS,
-            "capacity_mw": [0.0] * len(DEFAULT_TECHS),
-        }
-    )
-
-required = {"system", "technology", "capacity_mw"}
-if not required.issubset(df.columns):
-    st.error(f"El CSV debe tener columnas {sorted(list(required))}. Encontré: {list(df.columns)}")
+if not csv_path.exists():
+    st.error(f"No encontré {csv_path}. Créalo en el repo (data/inputs/).")
     st.stop()
 
-df["system"] = df["system"].astype(str).str.strip().str.upper()
+df = pd.read_csv(csv_path)
+
+cols = {"system", "technology", "capacity_mw"}
+if not cols.issubset(df.columns):
+    st.error(f"El CSV debe tener columnas {sorted(list(cols))}. Encontré: {list(df.columns)}")
+    st.stop()
+
+# Normalizar types
+df["system"] = df["system"].astype(str).str.upper().str.strip()
 df["technology"] = df["technology"].astype(str).str.strip()
 df["capacity_mw"] = pd.to_numeric(df["capacity_mw"], errors="coerce").fillna(0.0)
 
 sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"])
 
+# --- Si faltan filas para ese sistema, generarlas automáticamente ---
 df_sys = df[df["system"] == sistema].copy()
+
 if df_sys.empty:
-    st.info(f"No hay filas para {sistema}. Te pongo plantilla para que la llenes.")
+    st.info(f"No hay filas para {sistema}. Te genero plantilla base para que la llenes.")
     df_sys = pd.DataFrame(
-        {"system": [sistema] * len(DEFAULT_TECHS), "technology": DEFAULT_TECHS, "capacity_mw": [0.0] * len(DEFAULT_TECHS)}
+        {"system": sistema, "technology": TECNOLOGIAS_BASE, "capacity_mw": 0.0}
     )
 
-# Mostrar sin system
+# Si hay filas pero faltan tecnologías, completar las faltantes
+faltantes = [t for t in TECNOLOGIAS_BASE if t not in set(df_sys["technology"])]
+if faltantes:
+    df_missing = pd.DataFrame({"system": sistema, "technology": faltantes, "capacity_mw": 0.0})
+    df_sys = pd.concat([df_sys, df_missing], ignore_index=True)
+
+# Mostrar tabla SIN columna system (pero conservarla para guardar)
 df_display = df_sys[["technology", "capacity_mw"]].copy()
 
 st.subheader("Tabla (editable)")
@@ -149,27 +78,27 @@ edited_display = st.data_editor(
     },
 )
 
-# Reconstruir con system
+# Re-construir df completo para este sistema
 edited_full = edited_display.copy()
 edited_full["system"] = sistema
 edited_full = edited_full[["system", "technology", "capacity_mw"]]
 
+# Reintegrar al df total (quita sistema actual y pega versión editada)
 df_other = df[df["system"] != sistema].copy()
 df_out = pd.concat([df_other, edited_full], ignore_index=True)
 
-# ----------------------------
-# BUTTONS: SAVE LOCAL + DOWNLOAD + COMMIT
-# ----------------------------
+# Orden bonito
+df_out["system"] = df_out["system"].astype(str)
+df_out = df_out.sort_values(["system", "technology"]).reset_index(drop=True)
+
 col1, col2, col3 = st.columns(3)
 
-# A) Guardar (server local / cloud filesystem)
 with col1:
     if st.button("Guardar en server (data/processed)"):
         out_path = PROCESSED / f"{Path(archivo).stem}_edited.csv"
         df_out.to_csv(out_path, index=False)
-        st.success(f"Guardado en: {out_path}")
+        st.success(f"Guardado: {out_path}")
 
-# B) Descargar CSVs
 with col2:
     st.download_button(
         "Descargar (solo sistema)",
@@ -182,48 +111,8 @@ with col3:
     st.download_button(
         "Descargar (completo)",
         data=df_out.to_csv(index=False).encode("utf-8"),
-        file_name=f"{Path(archivo).stem}_FULL.csv",
+        file_name=f"{Path(archivo).stem}_edited.csv",
         mime="text/csv",
     )
 
-st.divider()
-
-# C) Commit a GitHub
-st.subheader("Guardar directo al repo (GitHub commit)")
-
-# Puedes cambiar la carpeta destino en el repo aquí:
-# - "data/processed/..." (recomendado)
-# - o "data/inputs/..." si quieres que “alimente” la app como input
-dest_folder = st.selectbox("Carpeta destino en el repo", ["data/processed", "data/inputs"], index=0)
-
-commit_filename = f"{Path(archivo).stem}_edited.csv"
-path_in_repo = f"{dest_folder}/{commit_filename}"
-
-commit_msg = st.text_input(
-    "Mensaje de commit",
-    value=f"Update capacidades {case_label} - {sistema}",
-)
-
-if not (GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO):
-    st.warning("Faltan secrets de GitHub. Configura GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO (y opcional GITHUB_BRANCH).")
-else:
-    if st.button("✅ Commit a GitHub ahora"):
-        try:
-            csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-            resp = github_put_file(
-                owner=GITHUB_OWNER,
-                repo=GITHUB_REPO,
-                branch=GITHUB_BRANCH,
-                token=GITHUB_TOKEN,
-                path_in_repo=path_in_repo,
-                content_bytes=csv_bytes,
-                commit_message=commit_msg,
-            )
-            commit_url = resp.get("commit", {}).get("html_url", "")
-            st.success(f"Listo: commiteado en `{path_in_repo}` en branch `{GITHUB_BRANCH}`.")
-            if commit_url:
-                st.write(commit_url)
-        except Exception as e:
-            st.error(f"Error haciendo commit: {e}")
-
-st.info("Tip: Semana 3 pide que estas capacidades sean trazables (fuente oficial + supuestos 2026 documentados).")
+st.info("Tip: En Semana 3-4 reemplazamos aproximados por fuentes oficiales y documentamos supuestos 2026.")
