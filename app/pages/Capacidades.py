@@ -37,15 +37,24 @@ sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"])
 
 df_sys = df[df["system"] == sistema].copy()
 
+# ✅ Mostrar tabla SIN la columna system
+df_display = df_sys[["technology", "capacity_mw"]].copy()
+
 st.subheader("Tabla (editable)")
-edited = st.data_editor(
-    df_sys,
+edited_display = st.data_editor(
+    df_display,
     num_rows="dynamic",
     use_container_width=True,
     column_config={
+        "technology": st.column_config.TextColumn("technology"),
         "capacity_mw": st.column_config.NumberColumn("capacity_mw", min_value=0.0, step=10.0),
     },
 )
+
+# ✅ Re-agregar system para guardar/descargar
+edited_full = edited_display.copy()
+edited_full["system"] = sistema
+edited_full = edited_full[["system", "technology", "capacity_mw"]]
 
 col1, col2 = st.columns(2)
 
@@ -53,7 +62,7 @@ with col1:
     if st.button("Guardar cambios (processed)"):
         # Reintegrar cambios al df completo
         df_other = df[df["system"] != sistema].copy()
-        df_out = pd.concat([df_other, edited], ignore_index=True)
+        df_out = pd.concat([df_other, edited_full], ignore_index=True)
 
         out_path = PROCESSED / f"{Path(archivo).stem}_edited.csv"
         df_out.to_csv(out_path, index=False)
@@ -63,7 +72,7 @@ with col1:
 with col2:
     st.download_button(
         "Descargar CSV editado (solo este sistema)",
-        data=edited.to_csv(index=False).encode("utf-8"),
+        data=edited_full.to_csv(index=False).encode("utf-8"),
         file_name=f"{sistema}_{Path(archivo).stem}.csv",
         mime="text/csv",
     )
