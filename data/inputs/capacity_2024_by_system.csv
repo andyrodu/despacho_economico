@@ -1,0 +1,19 @@
+system,technology,capacity_mw
+SIN,Ciclo combinado,9888
+SIN,Térmica convencional,15000
+SIN,Hidro,12000
+SIN,Eólica,9000
+SIN,Solar,12000
+SIN,Nuclear,1600
+BCA,Ciclo combinado,500
+BCA,Térmica convencional,200
+BCA,Hidro,0
+BCA,Eólica,250
+BCA,Solar,300
+BCA,Nuclear,0
+BCS,Ciclo combinado,600
+BCS,Térmica convencional,150
+BCS,Hidro,0
+BCS,Eólica,200
+BCS,Solar,350
+BCS,Nuclear,0
