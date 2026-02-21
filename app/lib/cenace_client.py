@@ -10,23 +10,27 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 
+# Endpoint AJAX de CENACE (lo usaste en Semana 1)
 CENACE_URL = "https://www.cenace.gob.mx/GraficaDemanda.aspx/obtieneValoresTotal"
+# Página referer para "warm-up" de cookies (ASP.NET a veces lo necesita)
+REFERER_PAGE = "https://www.cenace.gob.mx/GraficaDemanda.aspx"
 
-# Headers tipo navegador (esto ayuda MUCHO con sitios ASP.NET)
+# Headers tipo navegador (ayuda a que no te regrese HTML/bloqueo tan fácil)
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json; charset=UTF-8",
     "X-Requested-With": "XMLHttpRequest",
     "Origin": "https://www.cenace.gob.mx",
-    "Referer": "https://www.cenace.gob.mx/GraficaDemanda.aspx",
+    "Referer": REFERER_PAGE,
 }
+
 
 @dataclass
 class FetchResult:
     df: pd.DataFrame
     source: str  # "api" or "cache"
-    raw_len: int = 0
+    raw_len: int = 0  # tamaño aproximado de la respuesta cruda (debug)
 
 
 def _safe_mkdir(p: Path) -> None:
@@ -40,7 +44,9 @@ def _cache_path(cache_dir: Path, system: str, start: datetime, end: datetime) ->
 
 
 def _unwrap_payload(payload: Any) -> Any:
-    """Unwrap ASP.NET style: {"d": "...json..."} or {"d": {...}}"""
+    """
+    CENACE a veces responde ASP.NET style: {"d": "...json..."} o {"d": {...}}
+    """
     if isinstance(payload, dict) and "d" in payload:
         d = payload["d"]
         if isinstance(d, str):
@@ -53,6 +59,9 @@ def _unwrap_payload(payload: Any) -> Any:
 
 
 def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
+    """
+    Intenta detectar (timestamps, values) en distintas estructuras posibles.
+    """
     payload = _unwrap_payload(payload)
 
     if isinstance(payload, str):
@@ -76,13 +85,14 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
         ok = 0
         for x in sample:
             if isinstance(x, (int, float)):
-                ok += 1
+                ok += 1  # epoch-ish
             elif isinstance(x, str):
                 ok += 1
         return ok == len(sample)
 
     def walk(obj: Any) -> None:
         if isinstance(obj, dict):
+            # patrones directos
             for k1, k2 in [
                 ("timestamps", "values"),
                 ("fechas", "valores"),
@@ -94,6 +104,7 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
                 if k1 in obj and k2 in obj and isinstance(obj[k1], list) and isinstance(obj[k2], list):
                     candidates.append((obj[k1], obj[k2]))
 
+            # patrón tipo Highcharts: categories + series[{data:[]}]
             if "series" in obj and "categories" in obj and isinstance(obj["series"], list) and isinstance(obj["categories"], list):
                 cats = obj["categories"]
                 for s in obj["series"]:
@@ -104,6 +115,7 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
                 walk(v)
 
         elif isinstance(obj, list):
+            # lista de dicts con timestamp/value
             if obj and all(isinstance(x, dict) for x in obj):
                 possible_time_keys = ["timestamp", "time", "fecha", "datetime", "x"]
                 possible_val_keys = ["value", "val", "demanda", "y"]
@@ -119,20 +131,8 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
 
     walk(payload)
 
-    # heurística final: dict con dos listas
-    if isinstance(payload, dict):
-        lists = [(k, v) for k, v in payload.items() if isinstance(v, list)]
-        for i in range(len(lists)):
-            for j in range(len(lists)):
-                if i == j:
-                    continue
-                a = lists[i][1]
-                b = lists[j][1]
-                if looks_like_dates(a) and looks_like_values(b) and len(a) == len(b):
-                    candidates.append((a, b))
-
     if not candidates:
-        raise ValueError("No pude detectar series (timestamps/values) en la respuesta de CENACE.")
+        raise ValueError(f"No pude detectar series (timestamps/values). Tipo payload: {type(payload)}")
 
     candidates = [c for c in candidates if len(c[0]) == len(c[1]) and len(c[0]) > 0]
     candidates.sort(key=lambda c: len(c[0]), reverse=True)
@@ -140,6 +140,9 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
 
 
 def _parse_timestamps(ts: List[Any]) -> pd.DatetimeIndex:
+    """
+    Convierte timestamps epoch/ms/strings a DatetimeIndex naive (sin tz).
+    """
     if isinstance(ts[0], (int, float)):
         v = float(ts[0])
         unit = "ms" if v > 10_000_000_000 else "s"
@@ -169,20 +172,45 @@ def _quality_report(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def _try_request(payload: Dict[str, Any], timeout_s: int) -> Tuple[Any, int]:
-    r = requests.post(CENACE_URL, data=json.dumps(payload), headers=DEFAULT_HEADERS, timeout=timeout_s)
-    r.raise_for_status()
+def _try_request(session: requests.Session, payload: Dict[str, Any], timeout_s: int) -> Tuple[Any, int]:
+    """
+    Hace warm-up (GET a la página) + POST al endpoint.
+    Devuelve (json_data, raw_len).
+    Si regresa HTML / 403 / etc, lanza RuntimeError con snippet del body (para debug).
+    """
+    # warm-up
+    session.get(REFERER_PAGE, headers=DEFAULT_HEADERS, timeout=timeout_s)
 
-    # A veces r.json() falla aunque sea JSON
+    r = session.post(
+        CENACE_URL,
+        data=json.dumps(payload),
+        headers=DEFAULT_HEADERS,
+        timeout=timeout_s,
+    )
+
+    ct = (r.headers.get("Content-Type") or "").lower()
+    raw = r.text or ""
+    raw_len = len(raw.encode("utf-8", errors="ignore"))
+
+    if r.status_code != 200:
+        snippet = raw[:400].replace("\n", " ")
+        raise RuntimeError(f"HTTP {r.status_code} | Content-Type={ct} | body_snippet={snippet}")
+
+    # A veces devuelve HTML (bloqueo)
+    if "text/html" in ct or "<html" in raw.lower():
+        snippet = raw[:400].replace("\n", " ")
+        raise RuntimeError(f"Respuesta HTML (posible bloqueo). Content-Type={ct} | body_snippet={snippet}")
+
+    # intenta JSON
     try:
-        return r.json(), len(r.content)
+        return r.json(), raw_len
     except Exception:
-        txt = r.text
+        # intenta parsear el texto como JSON
         try:
-            return json.loads(txt), len(r.content)
+            return json.loads(raw), raw_len
         except Exception:
-            # regresa texto crudo para debug
-            return {"raw_text": txt}, len(r.content)
+            snippet = raw[:400].replace("\n", " ")
+            raise RuntimeError(f"No es JSON. Content-Type={ct} | body_snippet={snippet}")
 
 
 def fetch_demand_block(
@@ -193,35 +221,31 @@ def fetch_demand_block(
     retries: int = 3,
     timeout_s: int = 30,
 ) -> FetchResult:
+    """
+    Descarga demanda para [start, end) y cachea en disco.
+    Si falla API, intenta cargar caché.
+    """
     _safe_mkdir(cache_dir)
     cpath = _cache_path(cache_dir, system, start, end)
 
-    # ✅ probamos varios payloads (CENACE a veces ignora todo y solo da “último”)
+    # Intentamos varios payloads porque el endpoint real puede ignorarlos / variar
     payload_candidates = [
-        {},  # ← muchas veces funciona así tal cual
+        {},  # algunos endpoints ignoran filtros y regresan "algo"
         {"sistema": system},
         {
             "sistema": system,
             "fechaInicio": start.strftime("%Y-%m-%d"),
             "fechaFin": (end - timedelta(days=1)).strftime("%Y-%m-%d"),
         },
-        {
-            "Sistema": system,
-            "FechaInicio": start.strftime("%d/%m/%Y"),
-            "FechaFin": (end - timedelta(days=1)).strftime("%d/%m/%Y"),
-        },
     ]
 
     last_err: Optional[Exception] = None
+    session = requests.Session()
 
     for attempt in range(1, retries + 1):
         for payload in payload_candidates:
             try:
-                data, raw_len = _try_request(payload, timeout_s=timeout_s)
-
-                # si regresó texto crudo, forzamos error para intentar siguiente payload
-                if isinstance(data, dict) and "raw_text" in data and len(str(data["raw_text"])) < 5:
-                    raise ValueError("Respuesta vacía de CENACE")
+                data, raw_len = _try_request(session, payload, timeout_s=timeout_s)
 
                 ts, vals = _find_series(data)
                 idx = _parse_timestamps(ts)
@@ -229,12 +253,12 @@ def fetch_demand_block(
                 ser = pd.Series(vals, index=idx, name="demand_mw").astype("float64")
                 df = ser.to_frame().sort_index()
 
+                # cache
                 df.to_parquet(cpath, index=True)
                 return FetchResult(df=df, source="api", raw_len=raw_len)
 
             except Exception as e:
                 last_err = e
-                # intenta el siguiente payload
 
         time.sleep(0.8 * attempt)
 
@@ -242,7 +266,6 @@ def fetch_demand_block(
     if cpath.exists():
         df = pd.read_parquet(cpath)
         df.index = pd.to_datetime(df.index, errors="coerce")
-        # si por alguna razón vino como columna:
         if "demand_mw" not in df.columns and len(df.columns) == 1:
             df.columns = ["demand_mw"]
         return FetchResult(df=df.sort_index(), source="cache", raw_len=0)
@@ -256,6 +279,10 @@ def fetch_demand(
     days: int,
     cache_dir: Path,
 ) -> Tuple[pd.DataFrame, Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Batching <= 7 días por request. Concatena todo.
+    Devuelve df + reporte calidad global + reportes por bloque.
+    """
     if days < 1:
         raise ValueError("days debe ser >= 1")
 
@@ -289,6 +316,7 @@ def fetch_demand(
 
     df = pd.concat(all_parts).sort_index()
     df = df[~df.index.duplicated(keep="first")]
+
     global_q = _quality_report(df[["demand_mw"]])
 
     return df, global_q, blocks
