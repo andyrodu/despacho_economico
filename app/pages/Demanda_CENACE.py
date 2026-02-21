@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from app.lib.cenace_client import fetch_demand
+from lib.cenace_client import fetch_demand
 
 st.title("Demanda CENACE")
 st.caption("Semana 2: Demanda real CENACE (batch + cache + DST).")
@@ -55,3 +55,4 @@ if st.button("Descargar demanda"):
         file_name=f"demand_{system}_{start_date}_{days}d.csv",
         mime="text/csv",
     )
+
