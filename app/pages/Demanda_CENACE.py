@@ -75,7 +75,21 @@ else:
             f"Filas: {q.get('rows')} | NaNs: {q.get('nans')} | Neg: {q.get('negatives')} | "
             f"Duplicados: {q.get('duplicates')} | Missing hours: {q.get('missing_hours')}"
         )
+if st.button("Descargar demanda"):
+    with st.spinner("Descargando (con batching + caché)..."):
+        try:
+            df, q, blocks = fetch_demand(
+                system=system,
+                start=datetime.combine(start_date, datetime.min.time()),
+                days=int(days),
+                cache_dir=CACHE_DIR,
+            )
+        except Exception as e:
+            st.error(f"No se pudo descargar de CENACE. Error: {e}")
+            st.info("Tip: intenta otra fecha (más reciente) o vuelve a correr (a veces CENACE bloquea temporalmente).")
+            st.stop()
 
+    # (aquí ya va tu chart / reportes)
         # ✅ Gráfica
         st.subheader("Serie de demanda (MW)")
         if "demand_mw" not in df.columns:
@@ -125,4 +139,5 @@ else:
             file_name=f"demand_{meta['system']}_{meta['start_date']}_{meta['days']}d.csv",
             mime="text/csv",
         )
+
 
