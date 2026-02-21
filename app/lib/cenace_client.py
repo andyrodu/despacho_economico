@@ -10,14 +10,23 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 
-
 CENACE_URL = "https://www.cenace.gob.mx/GraficaDemanda.aspx/obtieneValoresTotal"
 
+# Headers tipo navegador (esto ayuda MUCHO con sitios ASP.NET)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://www.cenace.gob.mx",
+    "Referer": "https://www.cenace.gob.mx/GraficaDemanda.aspx",
+}
 
 @dataclass
 class FetchResult:
     df: pd.DataFrame
     source: str  # "api" or "cache"
+    raw_len: int = 0
 
 
 def _safe_mkdir(p: Path) -> None:
@@ -30,28 +39,36 @@ def _cache_path(cache_dir: Path, system: str, start: datetime, end: datetime) ->
     return cache_dir / f"demand_{system}_{s}_{e}.parquet"
 
 
-def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
-    """
-    Intenta encontrar (timestamps, values) en respuestas típicas.
-    - A veces viene como dict con llaves 'd' (ASP.NET) o 'Data' o 'Series'
-    - timestamps pueden venir como strings o epoch/ms
-    """
-    # Unwrap ASP.NET style: {"d": "...json..."} o {"d": {...}}
+def _unwrap_payload(payload: Any) -> Any:
+    """Unwrap ASP.NET style: {"d": "...json..."} or {"d": {...}}"""
     if isinstance(payload, dict) and "d" in payload:
         d = payload["d"]
-        try:
-            payload = json.loads(d) if isinstance(d, str) else d
-        except Exception:
-            payload = d
+        if isinstance(d, str):
+            try:
+                return json.loads(d)
+            except Exception:
+                return d
+        return d
+    return payload
 
-    # Si es string JSON
+
+def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
+    payload = _unwrap_payload(payload)
+
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except Exception:
             pass
 
-    # Helper: busca listas numéricas y listas de fechas
+    candidates: List[Tuple[List[Any], List[Any]]] = []
+
+    def looks_like_values(xs: List[Any]) -> bool:
+        if not xs:
+            return False
+        sample = xs[: min(5, len(xs))]
+        return all(isinstance(x, (int, float)) or x is None for x in sample)
+
     def looks_like_dates(xs: List[Any]) -> bool:
         if not xs:
             return False
@@ -59,23 +76,13 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
         ok = 0
         for x in sample:
             if isinstance(x, (int, float)):
-                ok += 1  # epoch-ish, lo parseamos luego
+                ok += 1
             elif isinstance(x, str):
                 ok += 1
         return ok == len(sample)
 
-    def looks_like_values(xs: List[Any]) -> bool:
-        if not xs:
-            return False
-        sample = xs[: min(5, len(xs))]
-        return all(isinstance(x, (int, float)) for x in sample)
-
-    # Candidatos: (dates, values)
-    candidates: List[Tuple[List[Any], List[Any]]] = []
-
     def walk(obj: Any) -> None:
         if isinstance(obj, dict):
-            # patrones comunes
             for k1, k2 in [
                 ("timestamps", "values"),
                 ("fechas", "valores"),
@@ -87,7 +94,6 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
                 if k1 in obj and k2 in obj and isinstance(obj[k1], list) and isinstance(obj[k2], list):
                     candidates.append((obj[k1], obj[k2]))
 
-            # series list: [{"data":[...], "name":...}, ...] + categories
             if "series" in obj and "categories" in obj and isinstance(obj["series"], list) and isinstance(obj["categories"], list):
                 cats = obj["categories"]
                 for s in obj["series"]:
@@ -98,9 +104,7 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
                 walk(v)
 
         elif isinstance(obj, list):
-            # lista de dicts con timestamp/value
             if obj and all(isinstance(x, dict) for x in obj):
-                # intenta llaves comunes
                 possible_time_keys = ["timestamp", "time", "fecha", "datetime", "x"]
                 possible_val_keys = ["value", "val", "demanda", "y"]
                 for tk in possible_time_keys:
@@ -108,14 +112,14 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
                         if tk in obj[0] and vk in obj[0]:
                             t = [x.get(tk) for x in obj]
                             y = [x.get(vk) for x in obj]
-                            if looks_like_dates(t) and all(isinstance(v, (int, float, type(None))) for v in y):
+                            if looks_like_dates(t) and looks_like_values(y):
                                 candidates.append((t, y))
             for v in obj:
                 walk(v)
 
     walk(payload)
 
-    # si no encontró patrones, intenta heurística básica sobre dict con dos listas
+    # heurística final: dict con dos listas
     if isinstance(payload, dict):
         lists = [(k, v) for k, v in payload.items() if isinstance(v, list)]
         for i in range(len(lists)):
@@ -130,31 +134,26 @@ def _find_series(payload: Any) -> Tuple[List[Any], List[Any]]:
     if not candidates:
         raise ValueError("No pude detectar series (timestamps/values) en la respuesta de CENACE.")
 
-    # elige el mejor candidato: mismo largo, values numéricos
     candidates = [c for c in candidates if len(c[0]) == len(c[1]) and len(c[0]) > 0]
     candidates.sort(key=lambda c: len(c[0]), reverse=True)
     return candidates[0]
 
 
 def _parse_timestamps(ts: List[Any]) -> pd.DatetimeIndex:
-    # epoch ms / epoch s / string
     if isinstance(ts[0], (int, float)):
-        # si parece ms (muy grande)
         v = float(ts[0])
         unit = "ms" if v > 10_000_000_000 else "s"
-        return pd.to_datetime(pd.Series(ts, dtype="float64"), unit=unit, errors="coerce").dt.tz_localize(None)
+        out = pd.to_datetime(pd.Series(ts, dtype="float64"), unit=unit, errors="coerce")
+        return pd.DatetimeIndex(out).tz_localize(None)
 
-    # strings
     out = pd.to_datetime(pd.Series(ts, dtype="string"), errors="coerce", utc=False)
     return pd.DatetimeIndex(out).tz_localize(None)
 
 
 def _quality_report(df: pd.DataFrame) -> Dict[str, Any]:
     s = df["demand_mw"]
-    # huecos/duplicados por timestamp
     idx = df.index
     duplicates = int(idx.duplicated().sum())
-    # si tiene frecuencia horaria, esperamos horas consecutivas
     missing = 0
     if len(idx) >= 2:
         full = pd.date_range(idx.min(), idx.max(), freq="H")
@@ -170,6 +169,22 @@ def _quality_report(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _try_request(payload: Dict[str, Any], timeout_s: int) -> Tuple[Any, int]:
+    r = requests.post(CENACE_URL, data=json.dumps(payload), headers=DEFAULT_HEADERS, timeout=timeout_s)
+    r.raise_for_status()
+
+    # A veces r.json() falla aunque sea JSON
+    try:
+        return r.json(), len(r.content)
+    except Exception:
+        txt = r.text
+        try:
+            return json.loads(txt), len(r.content)
+        except Exception:
+            # regresa texto crudo para debug
+            return {"raw_text": txt}, len(r.content)
+
+
 def fetch_demand_block(
     system: str,
     start: datetime,
@@ -178,51 +193,59 @@ def fetch_demand_block(
     retries: int = 3,
     timeout_s: int = 30,
 ) -> FetchResult:
-    """
-    Descarga demanda para [start, end) y cachea en disco.
-    Si falla API, intenta cargar caché.
-    """
     _safe_mkdir(cache_dir)
     cpath = _cache_path(cache_dir, system, start, end)
 
-    payload = {
-        # OJO: estos campos pueden variar por endpoint real.
-        # Ajusta aquí si tu JSON requiere otros nombres.
-        "sistema": system,
-        "fechaInicio": start.strftime("%Y-%m-%d"),
-        "fechaFin": (end - timedelta(days=1)).strftime("%Y-%m-%d"),
-    }
+    # ✅ probamos varios payloads (CENACE a veces ignora todo y solo da “último”)
+    payload_candidates = [
+        {},  # ← muchas veces funciona así tal cual
+        {"sistema": system},
+        {
+            "sistema": system,
+            "fechaInicio": start.strftime("%Y-%m-%d"),
+            "fechaFin": (end - timedelta(days=1)).strftime("%Y-%m-%d"),
+        },
+        {
+            "Sistema": system,
+            "FechaInicio": start.strftime("%d/%m/%Y"),
+            "FechaFin": (end - timedelta(days=1)).strftime("%d/%m/%Y"),
+        },
+    ]
 
     last_err: Optional[Exception] = None
 
     for attempt in range(1, retries + 1):
-        try:
-            r = requests.post(CENACE_URL, json=payload, timeout=timeout_s)
-            r.raise_for_status()
-            data = r.json()
+        for payload in payload_candidates:
+            try:
+                data, raw_len = _try_request(payload, timeout_s=timeout_s)
 
-            ts, vals = _find_series(data)
-            idx = _parse_timestamps(ts)
+                # si regresó texto crudo, forzamos error para intentar siguiente payload
+                if isinstance(data, dict) and "raw_text" in data and len(str(data["raw_text"])) < 5:
+                    raise ValueError("Respuesta vacía de CENACE")
 
-            ser = pd.Series(vals, index=idx, name="demand_mw").astype("float64")
-            df = ser.to_frame().sort_index()
+                ts, vals = _find_series(data)
+                idx = _parse_timestamps(ts)
 
-            # cache
-            df.to_parquet(cpath, index=True)
-            return FetchResult(df=df, source="api")
+                ser = pd.Series(vals, index=idx, name="demand_mw").astype("float64")
+                df = ser.to_frame().sort_index()
 
-        except Exception as e:
-            last_err = e
-            time.sleep(0.8 * attempt)
+                df.to_parquet(cpath, index=True)
+                return FetchResult(df=df, source="api", raw_len=raw_len)
+
+            except Exception as e:
+                last_err = e
+                # intenta el siguiente payload
+
+        time.sleep(0.8 * attempt)
 
     # fallback cache
     if cpath.exists():
         df = pd.read_parquet(cpath)
-        # si parquet no trae índice bien, fuerza
-        if "demand_mw" in df.columns:
-            df = df.set_index(df.columns[0]) if df.index.name is None else df
         df.index = pd.to_datetime(df.index, errors="coerce")
-        return FetchResult(df=df.sort_index(), source="cache")
+        # si por alguna razón vino como columna:
+        if "demand_mw" not in df.columns and len(df.columns) == 1:
+            df.columns = ["demand_mw"]
+        return FetchResult(df=df.sort_index(), source="cache", raw_len=0)
 
     raise RuntimeError(f"Falló CENACE y no hay caché disponible. Último error: {last_err}")
 
@@ -233,10 +256,6 @@ def fetch_demand(
     days: int,
     cache_dir: Path,
 ) -> Tuple[pd.DataFrame, Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Batching <= 7 días por request. Concatena todo.
-    Devuelve df + reporte calidad global + reportes por bloque.
-    """
     if days < 1:
         raise ValueError("days debe ser >= 1")
 
@@ -260,6 +279,7 @@ def fetch_demand(
                 "block_start": cursor.strftime("%Y-%m-%d"),
                 "block_days": chunk,
                 "source": res.source,
+                "raw_len": res.raw_len,
                 "quality": _quality_report(res.df),
             }
         )
@@ -268,9 +288,7 @@ def fetch_demand(
         remaining -= chunk
 
     df = pd.concat(all_parts).sort_index()
-    # quita duplicados por si algún bloque se traslapa
     df = df[~df.index.duplicated(keep="first")]
-
     global_q = _quality_report(df[["demand_mw"]])
 
     return df, global_q, blocks
