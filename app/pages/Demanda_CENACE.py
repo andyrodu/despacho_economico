@@ -2,9 +2,14 @@ import streamlit as st
 from datetime import datetime, date
 from pathlib import Path
 import pandas as pd
+import sys
 
-# ✅ IMPORT (si te funciona con app.lib, déjalo; si vuelve a fallar, cambia a: from lib.cenace_client import fetch_demand)
-from app.lib.cenace_client import fetch_demand
+# ✅ Esto hace que Python vea la carpeta "app/" como raíz de imports
+APP_DIR = Path(__file__).resolve().parents[1]   # .../app
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+from lib.cenace_client import fetch_demand
 
 st.title("Demanda CENACE")
 st.caption("Semana 2: Demanda real CENACE (batch + cache + DST).")
@@ -120,3 +125,4 @@ else:
             file_name=f"demand_{meta['system']}_{meta['start_date']}_{meta['days']}d.csv",
             mime="text/csv",
         )
+
